@@ -1,3 +1,16 @@
+"""
+MemU 核心服务层 - 整个记忆框架的入口点
+
+MemoryService 是 MemU 的主类,整合了:
+- 三层记忆架构 (Resource -> MemoryItem -> MemoryCategory)
+- 双重检索模式 (RAG 向量检索 / LLM 深度推理)
+- 灵活的工作流引擎
+- 强大的拦截器系统
+
+作者: xizil
+版本: 1.5.1
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -38,15 +51,58 @@ from memu.workflow.step import WorkflowState, WorkflowStep
 TConfigModel = TypeVar("TConfigModel", bound=BaseModel)
 
 
+# =============================================================================
+# 上下文对象
+# =============================================================================
+
 @dataclass
 class Context:
-    categories_ready: bool = False
-    category_ids: list[str] = field(default_factory=list)
-    category_name_to_id: dict[str, str] = field(default_factory=dict)
-    category_init_task: asyncio.Task | None = None
+    """
+    记忆服务的运行时上下文
 
+    管理分类初始化的异步状态,确保:
+    - 分类在首次使用时已完成初始化
+    - 支持多用户/多租户的场景隔离
+    """
+
+    categories_ready: bool = False  # 分类是否已初始化
+    category_ids: list[str] = field(default_factory=list)  # 已初始化的分类 ID 列表
+    category_name_to_id: dict[str, str] = field(default_factory=dict)  # 分类名到 ID 的映射
+    category_init_task: asyncio.Task | None = None  # 异步初始化任务
+
+
+# =============================================================================
+# 核心服务类
+# =============================================================================
 
 class MemoryService(MemorizeMixin, RetrieveMixin, CRUDMixin):
+    """
+    MemU 记忆框架的核心服务类
+
+    继承自三大 Mixin:
+    - MemorizeMixin: 记忆学习 (memorize) 功能
+    - RetrieveMixin: 记忆检索 (retrieve) 功能
+    - CRUDMixin: 记忆项的增删改查操作
+
+    核心职责:
+    1. 配置管理 - 统一管理 LLM、数据库、存储等配置
+    2. 客户端工厂 - 按需创建 LLM 客户端 (支持多 profile)
+    3. 拦截器系统 - 在 LLM 调用和工作流步骤前后注入逻辑
+    4. 工作流编排 - 管理 memorize/retrieve 等工作流的执行
+
+    示例:
+        >>> service = MemoryService()
+        >>> # 记忆一段对话
+        >>> result = await service.memorize(
+        ...     resource_url="对话内容",
+        ...     modality="conversation"
+        ... )
+        >>> # 检索相关记忆
+        >>> memories = await service.retrieve(
+        ...     queries=[{"role": "user", "content": {"text": "查询内容"}}]
+        ... )
+    """
+
     def __init__(
         self,
         *,
@@ -94,8 +150,22 @@ class MemoryService(MemorizeMixin, RetrieveMixin, CRUDMixin):
         )
         self._register_pipelines()
 
+    # =========================================================================
+    # LLM 客户端管理 (支持多后端、多 Profile)
+    # =========================================================================
+
     def _init_llm_client(self, config: LLMConfig | None = None) -> Any:
-        """Initialize LLM client based on configuration."""
+        """
+        根据配置初始化 LLM 客户端。
+
+        支持三种后端:
+        - sdk: 官方 OpenAI SDK (推荐生产环境使用)
+        - httpx: 通用 HTTP 客户端 (支持任意 OpenAI 兼容 API)
+        - lazyllm_backend: LazyLLM 集成 (用于懒加载大模型场景)
+
+        参数:
+            config: LLM 配置,若为 None 则使用默认配置
+        """
         cfg = config or self.llm_config
         backend = cfg.client_backend
         if backend == "sdk":
@@ -222,8 +292,23 @@ class MemoryService(MemorizeMixin, RetrieveMixin, CRUDMixin):
         return self._get_llm_client(profile, step_context=step_context)
 
     def _get_step_embedding_client(self, step_context: Mapping[str, Any] | None) -> Any:
+        """获取步骤专用的 Embedding 客户端。"""
         profile = self._llm_profile_from_context(step_context, task="embedding") or "embedding"
         return self._get_llm_client(profile, step_context=step_context)
+
+    # =========================================================================
+    # 拦截器系统 - 允许在 LLM 调用和工作流步骤前后注入自定义逻辑
+    # =========================================================================
+    #
+    # 拦截器类型:
+    # - before: 在操作执行前调用,可修改参数或记录日志
+    # - after: 在操作执行后调用,可处理结果或进行追踪
+    # - on_error: 在操作抛出异常时调用,用于错误处理和告警
+    #
+    # 使用示例:
+    #   service.intercept_before_llm_call(
+    #       lambda metadata, **kwargs: print(f"LLM调用: {metadata.operation}")
+    #   )
 
     def intercept_before_llm_call(
         self,
@@ -233,6 +318,18 @@ class MemoryService(MemorizeMixin, RetrieveMixin, CRUDMixin):
         priority: int = 0,
         where: Mapping[str, Any] | Callable[..., Any] | None = None,
     ) -> LLMInterceptorHandle:
+        """
+        注册 LLM 调用前拦截器。
+
+        参数:
+            fn: 拦截函数,签名为 (metadata, **kwargs)
+            name: 拦截器名称 (用于标识和取消)
+            priority: 优先级 (数值越大越先执行)
+            where: 条件过滤器,可指定在何种情况下触发
+
+        返回:
+            LLMInterceptorHandle: 用于取消注册
+        """
         return self._llm_interceptors.register_before(fn, name=name, priority=priority, where=where)
 
     def intercept_after_llm_call(
@@ -243,6 +340,7 @@ class MemoryService(MemorizeMixin, RetrieveMixin, CRUDMixin):
         priority: int = 0,
         where: Mapping[str, Any] | Callable[..., Any] | None = None,
     ) -> LLMInterceptorHandle:
+        """注册 LLM 调用后拦截器。"""
         return self._llm_interceptors.register_after(fn, name=name, priority=priority, where=where)
 
     def intercept_on_error_llm_call(
